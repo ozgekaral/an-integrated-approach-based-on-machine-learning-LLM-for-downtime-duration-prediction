@@ -1,0 +1,734 @@
+
+USE_LOG_TARGET_SHORT = True
+USE_LOG_TARGET_LONG = True
+
+def wrap_with_log_target(estimator, param_dist: dict):
+    
+    wrapped = TransformedTargetRegressor(
+        regressor=estimator,
+        func=np.log1p,
+        inverse_func=np.expm1,
+        check_inverse=False
+    )
+    new_param_dist = {f"regressor__{k}": v for k, v in (param_dist or {}).items()}
+    return wrapped, new_param_dist
+
+def unwrap_pipeline(maybe_wrapped):
+    
+    if isinstance(maybe_wrapped, TransformedTargetRegressor):
+        return getattr(maybe_wrapped, "regressor_", maybe_wrapped.regressor)
+    return maybe_wrapped
+
+up = files.upload()
+df_raw = pd.read_excel(SRC_PROD)
+df_raw.columns = df_raw.columns.str.strip()
+
+def preprocess_time(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    if "Ağırlık (gr)" in df.columns:
+        wcol = "Ağırlık (gr)"
+        df[wcol] = (
+            df[wcol]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        df[wcol] = pd.to_numeric(df[wcol], errors="coerce")
+
+    for c in list(df.columns):
+        if str(c).startswith("Unnamed"):
+            df = df.drop(columns=c)
+
+    COL_DATE  = "Date"
+    COL_START = "Start"
+    COL_END   = "Finish"
+
+    df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+    def fix_time(s):
+        s = str(s).strip()
+        if s == "" or s.lower() == "nan":
+            return np.nan
+        if s.count(":") == 1:
+            return s + ":00"
+        return s
+
+    df[COL_START] = df[COL_START].fillna("00:00").astype(str).map(fix_time)
+    df[COL_END]   = df[COL_END].fillna("00:00").astype(str).map(fix_time)
+
+    df["start_td"] = pd.to_timedelta(df[COL_START], errors="coerce")
+    df["end_td"]   = pd.to_timedelta(df[COL_END],   errors="coerce")
+
+    df["start_dt"] = df[COL_DATE] + df["start_td"]
+    df["end_dt"]   = df[COL_DATE] + df["end_td"]
+
+    df = df.dropna(subset=["start_dt", "end_dt"])
+    print("-> start_dt / end_dt NaN atıldıktan sonra:", len(df))
+
+    mask_next_day = df["end_dt"] < df["start_dt"]
+    df.loc[mask_next_day, "end_dt"] = df.loc[mask_next_day, "end_dt"] + pd.Timedelta(days=1)
+
+    df["window_min"] = (df["end_dt"] - df["start_dt"]).dt.total_seconds() / 60.0
+
+    return df
+
+df = preprocess_time(df_raw)
+df.columns = df.columns.str.strip()
+
+downtime_cols = [c for c in df.columns if "DOWNTIME" in c or "DOWNTİME" in c]
+if not downtime_cols:
+    raise ValueError("fail")
+
+COL_DOWNTIME = downtime_cols[0]
+print("Duruş hedef kolonu:", COL_DOWNTIME, "(minute)")
+
+df[COL_DOWNTIME] = pd.to_numeric(df[COL_DOWNTIME], errors="coerce")
+
+df = df.dropna(subset=[COL_DOWNTIME])
+df = df[df[COL_DOWNTIME] >= 0]
+
+MIN_DOWNTIME_MIN = 00.0
+removed_count = (df[COL_DOWNTIME] < MIN_DOWNTIME_MIN).sum()
+
+df = df[df[COL_DOWNTIME] >= MIN_DOWNTIME_MIN].copy()
+
+df = df.dropna(subset=[COL_DOWNTIME])
+df = df[df[COL_DOWNTIME] >= 0]
+
+numeric_features = []
+if "Net Çevrim" in df.columns:
+    numeric_features.append("cycle")
+if "Adet" in df.columns:
+    numeric_features.append("quantity")
+    df = df.dropna(subset=["quantity"])
+    df = df[df["quantity"] > 0].copy()
+
+numeric_features.append("window_min")
+
+categorical_features = []
+for col in ["Machine", "Period", "Device", "Raw", "Portion"]:
+    if col in df.columns:
+        categorical_features.append(col)
+
+for col in categorical_features:
+    df[col] = df[col].astype("string")
+
+
+X = df[numeric_features + categorical_features]
+y = df[COL_DOWNTIME] 
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+parca_test = df.loc[X_test.index, "Component"]
+
+numeric_transformer_tree = Pipeline(
+    steps=[("imputer", SimpleImputer(strategy="median"))]
+)
+
+categorical_transformer_tree = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ]
+)
+
+preprocessor_tree = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer_tree, numeric_features),
+        ("cat", categorical_transformer_tree, categorical_features),
+    ]
+)
+
+numeric_transformer_ann = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ]
+)
+
+categorical_transformer_ann = Pipeline(
+    steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+    ]
+)
+
+preprocessor_ann = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer_ann, numeric_features),
+        ("cat", categorical_transformer_ann, categorical_features),
+    ]
+)
+
+
+def train_and_eval(model_name, estimator, param_dist, use_ann_preprocessor=False):
+    chosen_prep = preprocessor_ann if use_ann_preprocessor else preprocessor_tree
+
+    pipe = Pipeline(
+        steps=[
+            ("prep", chosen_prep),
+            ("model", estimator),
+        ]
+    )
+
+    search_estimator = pipe
+    search_param_dist = param_dist
+
+    if USE_LOG_TARGET_SHORT:
+        search_estimator, search_param_dist = wrap_with_log_target(pipe, param_dist)
+
+    search = RandomizedSearchCV(
+        estimator=search_estimator,
+        param_distributions=search_param_dist,
+        n_iter=20,
+        cv=3,
+        scoring="neg_root_mean_squared_error",
+        random_state=42,
+        n_jobs=-1,
+        verbose=1,
+    )
+
+  
+    search.fit(X_train, y_train)
+    best_model = search.best_estimator_
+    print(f"{model_name} en iyi hiperparametreler:", search.best_params_)
+
+    y_pred = best_model.predict(X_test) 
+
+    rmse = mean_squared_error(y_test, y_pred) ** 0.5
+    mae = mean_absolute_error(y_test, y_pred)
+
+    mask_nonzero = y_test != 0
+    if mask_nonzero.sum() > 0:
+        mape = (
+            np.abs((y_test[mask_nonzero] - y_pred[mask_nonzero]) / y_test[mask_nonzero])
+        ).mean() * 100
+    else:
+        mape = np.nan
+
+    r2 = r2_score(y_test, y_pred)
+
+    print(
+        f"{model_name} | RMSE={rmse:.4f} dk  "
+        f"MAE={mae:.4f} dk  "
+        f"MAPE={mape:.2f}%  R2={r2:.4f}"
+    )
+
+    return {
+        "name": model_name,
+        "best_model": best_model,
+        "rmse": rmse,
+        "mae": mae,
+        "mape": mape,
+        "r2": r2,
+        "y_pred": pd.Series(y_pred, index=X_test.index),
+    }
+
+rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+param_rf = {
+    "model__n_estimators": [200, 300, 500],
+    "model__max_depth": [None, 10, 20, 30],
+    "model__min_samples_split": [2, 5, 10],
+    "model__min_samples_leaf": [1, 2, 4],
+    "model__max_features": ["sqrt", 0.5],
+}
+
+xgb = XGBRegressor(
+    random_state=42,
+    n_jobs=-1,
+    objective="reg:squarederror",
+    tree_method="hist"
+)
+param_xgb = {
+    "model__n_estimators": [200, 400],
+    "model__max_depth": [4, 6, 8],
+    "model__learning_rate": [0.05, 0.1],
+    "model__subsample": [0.8, 1.0],
+    "model__colsample_bytree": [0.8, 1.0],
+}
+
+dt = DecisionTreeRegressor(random_state=42)
+param_dt = {
+    "model__max_depth": [6, 10, 20, None],
+    "model__min_samples_split": [2, 5, 10],
+    "model__min_samples_leaf": [1, 2, 4],
+}
+
+ann = MLPRegressor(random_state=42, max_iter=300)
+param_ann = {
+    "model__hidden_layer_sizes": [(64, 32), (128, 64)],
+    "model__alpha": [1e-4, 1e-3],
+    "model__learning_rate_init": [0.001, 0.01],
+}
+
+
+results_list = []
+
+res_rf = train_and_eval("RandomForest", rf, param_rf, use_ann_preprocessor=False)
+results_list.append(res_rf)
+
+res_xgb = train_and_eval("XGBoost", xgb, param_xgb, use_ann_preprocessor=False)
+results_list.append(res_xgb)
+
+res_dt = train_and_eval("DecisionTree", dt, param_dt, use_ann_preprocessor=False)
+results_list.append(res_dt)
+
+res_ann = train_and_eval("ANN(MLP)", ann, param_ann, use_ann_preprocessor=True)
+results_list.append(res_ann)
+
+model_compare_df = pd.DataFrame(
+    [{
+        "model": r["name"],
+        "RMSE_dk": r["rmse"],
+        "MAE_dk": r["mae"],
+        "MAPE_%": r["mape"],
+        "R2": r["r2"],
+    } for r in results_list]
+).sort_values("RMSE_dk")
+
+
+best_res = min(results_list, key=lambda d: d["rmse"])
+best_name = best_res["name"]
+best_model = best_res["best_model"]
+best_pred = best_res["y_pred"]
+
+
+
+rmse_global = best_res["rmse"]
+mape_global = best_res["mape"]
+r2_global = best_res["r2"]
+
+global_metrics_df = pd.DataFrame([{
+    "Model": best_name,
+    "RMSE_dk": rmse_global,
+    "MAE_dk": best_res["mae"],
+    "MAPE_%": mape_global,
+    "R2": r2_global
+}])
+
+
+inner_pipe = unwrap_pipeline(best_model)
+inner_model = inner_pipe.named_steps["model"]
+prep = inner_pipe.named_steps["prep"]
+
+X_test_tr = prep.transform(X_test)
+
+if isinstance(inner_model, RandomForestRegressor):
+    tree_preds = np.stack(
+        [est.predict(X_test_tr) for est in inner_model.estimators_],
+        axis=1
+    )
+
+    if USE_LOG_TARGET_SHORT:
+        tree_preds = np.expm1(tree_preds)
+
+    pred_mean = tree_preds.mean(axis=1)
+    pred_std = tree_preds.std(axis=1)
+
+    low = np.clip(pred_mean - pred_std, 0, None)
+    high = pred_mean + pred_std
+
+    conf_ratio = 1 - (pred_std / (np.abs(pred_mean) + 1e-6))
+    conf_ratio = np.clip(conf_ratio, 0, 1)
+    conf_percent = conf_ratio * 100
+else:
+    pred_mean = best_pred.values
+    low = np.clip(pred_mean - 1.645 * rmse_global, 0, None)
+    high = pred_mean + 1.645 * rmse_global
+    conf_percent = np.full_like(pred_mean, 90.0, dtype=float)
+
+y_downtime_pred = pd.Series(pred_mean, index=X_test.index)
+low_series = pd.Series(low, index=X_test.index)
+high_series = pd.Series(high, index=X_test.index)
+conf_series = pd.Series(conf_percent, index=X_test.index)
+
+
+feat_names = prep.get_feature_names_out()
+
+if hasattr(inner_model, "feature_importances_"):
+    importances = inner_model.feature_importances_
+
+    agg = {}
+    for f_name, imp in zip(feat_names, importances):
+        if f_name.startswith("num__"):
+            base = f_name.replace("num__", "")
+        elif f_name.startswith("cat__"):
+            tmp = f_name.replace("cat__", "")
+            base = tmp.split("_")[0]
+        else:
+            base = f_name
+        agg[base] = agg.get(base, 0) + imp
+
+    agg_df = pd.DataFrame(list(agg.items()), columns=["orig_feature", "importance"])
+    agg_df = agg_df.sort_values("importance", ascending=False)
+
+
+else:
+ 
+    agg_df = pd.DataFrame(columns=["orig_feature", "importance"])
+
+top_feats = list(agg_df["orig_feature"].head(3))
+top_features_text = ", ".join(
+    f"{row.orig_feature} (importance={row.importance:.3f})"
+    for _, row in agg_df.head(5).iterrows()
+)
+
+preds_df = pd.DataFrame({
+    "component": parca_test,
+    "real_downtime": y_test,
+    "predict_downtime": y_downtime_pred,
+    "predict_min": low_series,
+    "predict_max": high_series,
+    "modelconf_%": conf_series,
+})
+
+results = []
+for part_code, g in preds_df.groupby("component"):
+    y_true_p = g["real_downtime"]
+    y_pred_p = g["predict_downtime"]
+
+    rmse_p = mean_squared_error(y_true_p, y_pred_p) ** 0.5
+    mae_p = mean_absolute_error(y_true_p, y_pred_p)
+
+    mask_nonzero_p = y_true_p != 0
+    if mask_nonzero_p.sum() > 0:
+        mape_p = (
+            np.abs(
+                (y_true_p[mask_nonzero_p] - y_pred_p[mask_nonzero_p])
+                / y_true_p[mask_nonzero_p]
+            )
+        ).mean() * 100
+    else:
+        mape_p = np.nan
+
+    r2_p = r2_score(y_true_p, y_pred_p)
+
+    results.append({
+        "parca_kodu": part_code,
+        "n_test": len(y_true_p),
+        "RMSE_dk": rmse_p,
+        "MAE_dk": mae_p,
+        "MAPE_%": mape_p,
+        "R2": r2_p,
+    })
+
+metrics_df = pd.DataFrame(results).sort_values("component")
+
+
+explanations = []
+for idx in preds_df.index:
+    mean = preds_df.loc[idx, "predict_downtime"]
+    low_i = preds_df.loc[idx, "predict_min"]
+    high_i = preds_df.loc[idx, "predict_max"]
+    conf_i = preds_df.loc[idx, "modelconf_%"]
+
+    parts = [
+        f"predict_downtime ≈ {mean:.1f} dk",
+        f"modelconf ≈ %{conf_i:.0f}",
+        f"part: {low_i:.1f}-{high_i:.1f} dk",
+    ]
+
+    feat_desc = []
+    for f in top_feats:
+        if f in X_test.columns:
+            val = X_test.loc[idx, f]
+            feat_desc.append(f"{f}={val}")
+    if feat_desc:
+        parts.append("etkili değişkenler: " + ", ".join(map(str, feat_desc)))
+
+    explanations.append("; ".join(parts))
+
+preds_df["explanation"] = explanations
+
+
+global_defaults = {}
+for col in numeric_features:
+    global_defaults[col] = df[col].median()
+for col in categorical_features:
+    mode_series = df[col].mode()
+    global_defaults[col] = mode_series.iloc[0] if not mode_series.empty else None
+
+def build_feature_row_for_part(
+    part_code,
+    machine=None,
+    mold=None,
+    qty=None,
+    goz_sayisi=None,
+    vardiya=None,
+    hammadde=None,
+):
+    subset = df[df["Component"] == part_code]
+    values = {}
+
+    for col in numeric_features + categorical_features:
+        if col in subset and not subset[col].isna().all():
+            if col in numeric_features:
+                values[col] = subset[col].median()
+            else:
+                mode_series = subset[col].mode()
+                values[col] = (
+                    mode_series.iloc[0]
+                    if not mode_series.empty
+                    else global_defaults[col]
+                )
+        else:
+            values[col] = global_defaults[col]
+
+    if machine is not None and "Machine" in categorical_features:
+        values["Machine"] = machine
+    if mold is not None and "Device" in categorical_features:
+        values["Device"] = mold
+    if qty is not None and "Quantity" in numeric_features:
+        values["Quantity"] = qty
+    if por is not None and "Portion" in categorical_features:
+        values["Portion"] = por
+    if per is not None and "Period" in categorical_features:
+        values["Period"] = per
+    if raw is not None and "Raw" in categorical_features:
+        values["Hammadde Kodu"] = raw
+
+    X_new = pd.DataFrame([values])
+
+    for col in categorical_features:
+        if col in X_new.columns:
+            X_new[col] = X_new[col].astype("string")
+
+    return X_new, values
+
+def predict_downtime_for_user_input(
+    part_code,
+    machine=None,
+    mold=None,
+    qty=None,
+    por=None,
+    per=None,
+    raw=None,
+):
+    X_new, base_vals = build_feature_row_for_part(
+        part_code,
+        machine=machine,
+        mold=mold,
+        qty=qty,
+        por=por,
+        per=per,
+        raw=raw,
+    )
+
+    pred_mean = best_model.predict(X_new)[0]
+
+    inner_pipe_local = unwrap_pipeline(best_model)
+    inner_model_local = inner_pipe_local.named_steps["model"]
+    prep_local = inner_pipe_local.named_steps["prep"]
+    X_new_tr = prep_local.transform(X_new)
+
+    if isinstance(inner_model_local, RandomForestRegressor):
+        tree_preds_new = np.stack(
+            [est.predict(X_new_tr) for est in inner_model_local.estimators_],
+            axis=1
+        )
+        if USE_LOG_TARGET_SHORT:
+            tree_preds_new = np.expm1(tree_preds_new)
+
+        mean_ = tree_preds_new.mean(axis=1)[0]
+        std_ = tree_preds_new.std(axis=1)[0]
+
+        low = max(mean_ - std_, 0)
+        high = mean_ + std_
+
+        conf_ratio = 1 - (std_ / (abs(mean_) + 1e-6))
+        conf_ratio = np.clip(conf_ratio, 0, 1)
+        conf_percent = conf_ratio * 100
+    else:
+        mean_ = pred_meanr
+        low = max(mean_ - 1.645 * rmse_global, 0)
+        high = mean_ + 1.645 * rmse_global
+        conf_percent = 90.0
+
+    info = {
+        "Component": part_code,
+        "Machine": base_vals.get("Machine", machine),
+        "Device": base_vals.get("Device", mold),
+        "Quantity": base_vals.get("quantity", qty),
+        "predict_downtime": mean_,
+        "predict_min": low,
+        "predict_max": high,
+        "modelconf_%": conf_percent,
+        "model_name": best_name,
+        "global_MAPE_%": mape_global,
+        "global_RMSE_dk": rmse_global,
+    }
+
+    return info
+
+agg_dict = {COL_DOWNTIME: "sum"}
+if "Adet" in df.columns:
+    agg_dict["Quantity"] = "sum"
+if "Cycle" in df.columns:
+    agg_dict["Cycle"] = "mean"
+
+df_daily = df.groupby("Date").agg(agg_dict).reset_index()
+df_daily = df_daily.rename(columns={COL_DOWNTIME: "downtime_day_dk"})
+
+df_daily["dayofweek"] = df_daily["Day"].dt.dayofweek
+df_daily["weekofyear"] = df_daily["Day"].dt.isocalendar().week.astype(int)
+df_daily["month"] = df_daily["Day"].dt.month
+df_daily["year"] = df_daily["Day"].dt.year
+
+long_feature_cols = []
+for c in ["Quantity", "Cycle", "dayofweek", "weekofyear", "month", "year"]:
+    if c in df_daily.columns:
+        long_feature_cols.append(c)
+
+
+X_long = df_daily[long_feature_cols]
+y_long = df_daily["downtime_day_dk"]
+
+df_daily = df_daily.sort_values("Date")
+idx_all = df_daily.index.to_list()
+split_idx = int(len(idx_all) * 0.8)
+train_idx = idx_all[:split_idx]
+test_idx = idx_all[split_idx:]
+
+X_train_long = X_long.loc[train_idx]
+X_test_long = X_long.loc[test_idx]
+y_train_long = y_long.loc[train_idx]
+y_test_long = y_long.loc[test_idx]
+
+
+long_models_base = {
+    "RF_long": RandomForestRegressor(random_state=42, n_estimators=300),
+    "XGB_long": XGBRegressor(
+        random_state=42,
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.1,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="reg:squarederror",
+        tree_method="hist",
+    ),
+    "DT_long": DecisionTreeRegressor(
+        random_state=42,
+        max_depth=6,
+        min_samples_split=5,
+        min_samples_leaf=2,
+    ),
+    "ANN_long": MLPRegressor(
+        hidden_layer_sizes=(64, 32),
+        alpha=1e-3,
+        learning_rate_init=0.001,
+        max_iter=500,
+        random_state=42,
+    ),
+}
+
+
+long_models = {}
+for name, base_mdl in long_models_base.items():
+    if USE_LOG_TARGET_LONG:
+        long_models[name] = TransformedTargetRegressor(
+            regressor=base_mdl,
+            func=np.log1p,
+            inverse_func=np.expm1,
+            check_inverse=False
+        )
+    else:
+        long_models[name] = base_mdl
+
+long_results = []
+
+for name, mdl in long_models.items():
+    mdl.fit(X_train_long, y_train_long)
+    y_pred_long = mdl.predict(X_test_long)  
+
+    rmse_long = mean_squared_error(y_test_long, y_pred_long) ** 0.5
+    mae_long = mean_absolute_error(y_test_long, y_pred_long)
+
+    if (y_test_long != 0).sum() > 0:
+        mape_long = (
+            np.abs((y_test_long - y_pred_long) / y_test_long)[y_test_long != 0]
+        ).mean() * 100
+    else:
+        mape_long = np.nan
+
+    r2_long = r2_score(y_test_long, y_pred_long)
+
+    long_results.append({
+        "model": name,
+        "rmse": rmse_long,
+        "mae": mae_long,
+        "mape": mape_long,
+        "r2": r2_long,
+        "y_pred": pd.Series(y_pred_long, index=y_test_long.index),
+        "sk_model": mdl,
+    })
+
+    print(
+        f"[LONG-TERM] {name} | RMSE={rmse_long:.2f} dk/gün  "
+        f"MAE={mae_long:.2f} dk/gün  "
+        f"MAPE={mape_long:.2f}%  R2={r2_long:.3f}"
+    )
+
+long_compare_df = pd.DataFrame(
+    [{
+        "model": r["model"],
+        "RMSE_dk_gun": r["rmse"],
+        "MAE_dk_gun": r["mae"],
+        "MAPE_%": r["mape"],
+        "R2": r["r2"],
+    } for r in long_results]
+).sort_values("RMSE_dk_gun")
+
+
+best_long_res = min(long_results, key=lambda d: d["rmse"])
+best_long_name = best_long_res["model"]
+long_model = best_long_res["sk_model"]
+rmse_long_global = best_long_res["rmse"]
+
+
+
+y_pred_long_best = best_long_res["y_pred"]
+dates_test_long = df_daily.loc[test_idx, "Tarih"]
+
+
+if isinstance(long_model, TransformedTargetRegressor):
+    inner_long = getattr(long_model, "regressor_", long_model.regressor)
+else:
+    inner_long = long_model
+
+if isinstance(inner_long, RandomForestRegressor):
+    tree_preds_long = np.stack(
+        [est.predict(X_test_long.values) for est in inner_long.estimators_],
+        axis=1
+    )
+    if USE_LOG_TARGET_LONG:
+        tree_preds_long = np.expm1(tree_preds_long)
+
+    mean_long = tree_preds_long.mean(axis=1)
+    std_long = tree_preds_long.std(axis=1)
+
+    low_long = np.clip(mean_long - std_long, 0, None)
+    high_long = mean_long + std_long
+
+    conf_ratio_long = 1 - (std_long / (np.abs(mean_long) + 1e-6))
+    conf_ratio_long = np.clip(conf_ratio_long, 0, 1)
+    conf_percent_long = conf_ratio_long * 100
+else:
+    mean_long = y_pred_long_best.values
+    low_long = np.clip(mean_long - 1.645 * rmse_long_global, 0, None)
+    high_long = mean_long + 1.645 * rmse_long_global
+    conf_percent_long = np.full_like(mean_long, 90.0, dtype=float)
+
+df_long_preds = pd.DataFrame({
+    "Tarih": dates_test_long.values,
+    "gercek_toplam_sure_kaybi_dk": y_test_long.values,
+    "tahmin_toplam_sure_kaybi_dk": mean_long,
+    "tahmin_alt_dk": low_long,
+    "tahmin_ust_dk": high_long,
+    "model_guven_%": conf_percent_long,
+})
+

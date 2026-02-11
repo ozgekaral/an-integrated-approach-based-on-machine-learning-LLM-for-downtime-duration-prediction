@@ -1,0 +1,432 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+def normalize_text(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _to_py(obj):
+    import numpy as _np
+    import pandas as _pd
+
+    if obj is None:
+        return None
+    if isinstance(obj, (_np.integer,)):
+        return int(obj)
+    if isinstance(obj, (_np.floating,)):
+        return float(obj)
+    if isinstance(obj, (_np.bool_,)):
+        return bool(obj)
+    if isinstance(obj, _pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, _pd.Timedelta):
+        return str(obj)
+    if isinstance(obj, _np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, _pd.Series):
+        return obj.astype(object).tolist()
+    if isinstance(obj, _pd.DataFrame):
+        return obj.astype(object).to_dict(orient="records")
+    return obj
+
+def json_dumps_safe(payload, **kwargs):
+    return json.dumps(payload, ensure_ascii=False, default=_to_py, **kwargs)
+
+def safe_parse_json(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        l = text.find("{")
+        r = text.rfind("}")
+        if l != -1 and r != -1 and r > l:
+            try:
+                return json.loads(text[l:r+1])
+            except Exception:
+                return None
+        return None
+
+def select_cause_cols_suffix(df: pd.DataFrame, suffix=" - Downtime", expected=18):
+    cause_cols = [c for c in df.columns if suffix in str(c) and "Total" not in str(c)]
+    if len(cause_cols) > expected:
+        cause_cols = list(cause_cols[:expected])
+    return cause_cols
+
+def build_action_pool_from_kitap1(
+    cause_cols,
+    xlsx_path="data/Book.xlsx",
+    col_problem="Problem Group",
+    col_action="Solution",
+    suffix=" - Downtime"
+):
+    df_act = pd.read_excel(xlsx_path)
+    df_act.columns = [normalize_text(c) for c in df_act.columns]
+
+    if col_problem not in df_act.columns or col_action not in df_act.columns:
+        raise ValueError(
+            f"Columns '{col_problem}' and '{col_action}' were not found in Book.xlsx. "
+            f"Existing columns: {list(df_act.columns)}"
+        )
+
+    df_act[col_problem] = df_act[col_problem].astype(str).map(normalize_text)
+    df_act[col_action]  = df_act[col_action].astype(str).map(normalize_text)
+
+    group_actions = (
+        df_act.groupby(col_problem)[col_action]
+        .apply(lambda x: sorted(set([a for a in x.dropna().tolist() if a and a.lower() != "nan"])))
+        .to_dict()
+    )
+
+    def base_name(cause_col: str) -> str:
+        return normalize_text(str(cause_col).replace(suffix, ""))
+
+    action_pool = {}
+    for c in cause_cols:
+        action_pool[c] = group_actions.get(base_name(c), [])
+
+    covered = sum(1 for c in cause_cols if len(action_pool.get(c, [])) > 0)
+  
+    return action_pool
+
+
+def get_row_true_top3(df, idx, cause_cols, top_k=3, min_pos_required=1):
+    row_vals = df.loc[idx, cause_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    pos = row_vals[row_vals > 0].sort_values(ascending=False)
+    pos_count = int((row_vals > 0).sum())
+    if len(pos) < min_pos_required:
+        return [], row_vals.to_dict(), pos_count
+    return list(pos.index[:top_k]), row_vals.to_dict(), pos_count
+
+def get_row_cause_values(df, idx, cause_cols):
+    row = df.loc[idx, cause_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return {str(k): float(v) for k, v in row.items()}
+
+
+FEW_SHOT_STATIC_EN = r"""
+[FEW-SHOT EXAMPLE]
+DATA:
+{
+  "row_cause_minutes_top": [
+    {"cause":"Machine Mechanical","min":120},
+    {"cause":"Head,"min":45},
+    {"cause":"Unexpected Downtime","min":30}
+  ],
+  "allowed_causes": [
+    "Machine Mechanical",
+    "Head",
+    "Unexpected Downtime"
+  ],
+  "allowed_actions": {
+    "Machine Mechanical": [
+      "Apply a mechanical inspection checklist.",
+      "Increase the preventive maintenance frequency."
+    ],
+    "Head": [
+      "Calibrate the temperature sensors.",
+      "Review and optimize heating/cooling parameters."
+    ]
+  }
+}
+OUTPUT (JSON ONLY):
+{
+  "summary": "The main downtime drivers appear to be mechanical issues and temperature-related stops.",
+  "top_causes": [
+    {
+      "cause":"Machine Mechanical",
+      "why":"Highest downtime minutes in this record.",
+      "evidence":{"row_min":120},
+      "actions":[
+        "Apply a mechanical inspection checklist.",
+        "Increase the preventive maintenance frequency."
+      ]
+    },
+    {
+      "cause":"Head",
+      "why":"Second-highest downtime minutes in this record.",
+      "evidence":{"row_min":45},
+      "actions":[
+        "Calibrate the temperature sensors.",
+        "Review and optimize heating/cooling parameters."
+      ]
+    },
+    {
+      "cause":"Unexpected Downtime",
+      "why":"Third-highest downtime minutes in this record.",
+      "evidence":{"row_min":30},
+      "actions":[
+        "Improve downtime logging and labeling standards."
+      ]
+    }
+  ],
+  "notes": []
+}
+""".strip()
+
+
+def build_rowlevel_prompt(
+    info, df, idx, cause_cols, action_pool,
+    top_cause_lines=18, top_actions_per_cause=6
+):
+    row_map = get_row_cause_values(df, idx, cause_cols)
+    row_list = [{"cause": c, "min": float(row_map.get(c, 0.0))} for c in cause_cols]
+    row_list = sorted(row_list, key=lambda x: x["min"], reverse=True)[:top_cause_lines]
+
+    allowed_actions = {}
+    for c in cause_cols:
+        acts = action_pool.get(c, [])
+        if acts:
+            allowed_actions[c] = acts[:top_actions_per_cause]
+
+    payload = {
+        "input": {
+            "part_code": _to_py(info.get("Component")),
+            "machine": _to_py(info.get("Machine")),
+            "mold_code": _to_py(info.get("Device")),
+            "qty": _to_py(info.get("Quantity")),
+        },
+        "model_output": {
+            "predicted_downtime_min": float(info.get("predicted_downtime_min", 0.0)),
+            "interval_min": [float(info.get("predict_min", 0.0)), float(info.get("predict_max", 0.0))],
+            "confidence_percent": float(info.get("modelconf_%", 0.0)),
+            "regressor": str(info.get("model_name", "")),
+        },
+        "row_cause_minutes_top": row_list,
+        "allowed_causes": [str(c) for c in cause_cols],
+        "allowed_actions": allowed_actions,
+        "requirements": {
+            "pick_top_k": 3,
+            "json_only": True,
+            "no_markdown": True,
+            "no_extra_text": True,
+            "no_duplicate_causes": True,
+            "actions_rule": "If allowed_actions has items for a cause, pick actions ONLY from that list. If not, generate 1-2 general but concrete actions."
+        }
+    }
+
+    instruction = (
+        "You are a manufacturing engineering assistant.\n"
+        "Task: pick the TOP 3 causes by minutes from DATA.row_cause_minutes_top.\n"
+        "RULES:\n"
+        "1) Output JSON ONLY (no Markdown / no extra text).\n"
+        "2) top_causes must contain EXACTLY 3 unique causes.\n"
+        "3) cause must be selected ONLY from allowed_causes.\n"
+        "4) evidence.row_min must equal the minute value of that cause in the row.\n"
+        "5) actions:\n"
+        "   - If allowed_actions exists for that cause: choose actions ONLY from allowed_actions.\n"
+        "   - If allowed_actions does NOT exist: generate 1-2 general but concrete actions.\n"
+    )
+
+    prompt = (
+        instruction
+        + "\n\nFEW-SHOT:\n" + FEW_SHOT_STATIC_EN
+        + "\n\nDATA:\n" + json_dumps_safe(payload)
+    )
+    return prompt
+
+def load_hf_model(model_id, use_8bit=False):
+    tok = AutoTokenizer.from_pretrained(model_id)
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+
+    kwargs = {"device_map": "auto"}
+    if use_8bit:
+        kwargs["load_in_8bit"] = True
+
+    mdl = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+
+    if getattr(mdl.config, "pad_token_id", None) is None and tok.eos_token_id is not None:
+        mdl.config.pad_token_id = tok.eos_token_id
+    return tok, mdl
+
+def generate_json_only(model, tokenizer, prompt, max_new_tokens=220):
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+            repetition_penalty=1.05,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    gen_tokens = out[0, inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
+
+
+def stabilize_llm_json_for_output(parsed, df, idx, cause_cols, action_pool):
+    allowed_set = set(map(str, cause_cols))
+    row_map = get_row_cause_values(df, idx, cause_cols)
+
+    if parsed is None or not isinstance(parsed, dict):
+        parsed = {}
+    parsed.setdefault("summary", "")
+    parsed.setdefault("notes", [])
+
+    top = parsed.get("top_causes", [])
+    if not isinstance(top, list):
+        top = []
+
+    fixed, seen = [], set()
+
+    for item in top:
+        if not isinstance(item, dict):
+            continue
+
+        c_raw = str(item.get("cause", "")).strip()
+        c_norm = normalize_text(c_raw)
+
+        if c_raw in allowed_set:
+            c = c_raw
+        elif c_norm in allowed_set:
+            c = c_norm
+        else:
+            continue
+
+        if c in seen:
+            continue
+        seen.add(c)
+
+        item.setdefault("why", "")
+
+        ev = item.get("evidence", {})
+        if not isinstance(ev, dict):
+            ev = {}
+        ev["row_min"] = float(row_map.get(c, 0.0))
+        item["evidence"] = ev
+
+        acts = item.get("actions", [])
+        if not isinstance(acts, list):
+            acts = [acts]
+        acts = [normalize_text(a) for a in acts if normalize_text(a)]
+
+        allowed_acts = [normalize_text(a) for a in action_pool.get(c, [])]
+        if allowed_acts:
+            allowed_acts_set = set(allowed_acts)
+            acts = [a for a in acts if a in allowed_acts_set]
+            if not acts:
+                acts = allowed_acts[:2]
+        else:
+            # If there is no allowlist, keep LLM-generated actions if any; otherwise use a fallback.
+            if not acts:
+                acts = ["Apply a quick checklist inspection.", "Start a 5-Why root-cause analysis."]
+
+        item["cause"] = c
+        item["actions"] = acts[:2]
+        fixed.append(item)
+
+    # Fill missing items using the highest-minute causes in the row (for output stability)
+    row_sorted = sorted(
+        [{"cause": c, "min": float(row_map.get(c, 0.0))} for c in cause_cols],
+        key=lambda x: x["min"],
+        reverse=True
+    )
+    for it in row_sorted:
+        if len(fixed) >= 3:
+            break
+        c = it["cause"]
+        if c in seen:
+            continue
+        seen.add(c)
+        allowed_acts = [normalize_text(a) for a in action_pool.get(c, [])]
+        acts = allowed_acts[:2] if allowed_acts else ["Apply a quick checklist inspection."]
+        fixed.append({
+            "cause": c,
+            "why": "Backfilled for output stability.",
+            "evidence": {"row_min": float(row_map.get(c, 0.0))},
+            "actions": acts[:2]
+        })
+
+    parsed["top_causes"] = fixed[:3]
+    return parsed
+
+def extract_pred_top3_raw(parsed_json):
+    top = parsed_json.get("top_causes") or []
+    if not isinstance(top, list):
+        return []
+    out = []
+    for it in top:
+        if isinstance(it, dict):
+            c = str(it.get("cause", "")).strip()
+            if c:
+                out.append(c)
+    seen, uniq = set(), []
+    for c in out:
+        if c not in seen:
+            uniq.append(c); seen.add(c)
+    return uniq[:3]
+
+
+def explain_rowlevel(
+    tokenizer, model, df, idx, info,
+    cause_cols, action_pool,
+    max_new_tokens=220, top_actions_per_cause=6, top_cause_lines=18
+):
+    prompt = build_rowlevel_prompt(
+        info=info, df=df, idx=idx,
+        cause_cols=cause_cols, action_pool=action_pool,
+        top_cause_lines=top_cause_lines,
+        top_actions_per_cause=top_actions_per_cause
+    )
+
+    t0 = time.time()
+    raw_text = generate_json_only(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
+    latency = time.time() - t0
+
+    raw_parsed = safe_parse_json(raw_text) or {}
+    stabilized = stabilize_llm_json_for_output(raw_parsed, df, idx, cause_cols, action_pool)
+    pred_top3_raw = extract_pred_top3_raw(raw_parsed)
+
+    true_top3, _, pos_count = get_row_true_top3(df, idx, cause_cols, top_k=3, min_pos_required=1)
+
+    return {
+        "raw_text": raw_text,
+        "raw_json": raw_parsed,
+        "stable_json": stabilized,
+        "pred_top3_raw": pred_top3_raw,
+        "true_top3": true_top3,
+        "pos_cause_count": pos_count,
+        "latency_sec": latency
+    }
+
+MODEL_ID_1 = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_ID_2 = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+print("Loading LLM models...")
+tokenizer1, model_llm1 = load_hf_model(MODEL_ID_1, use_8bit=False)
+tokenizer2, model_llm2 = load_hf_model(MODEL_ID_2, use_8bit=False)
+
+
+cause_cols = select_cause_cols_suffix(df, suffix=" - Downtime", expected=18)
+print("cause_cols:", len(cause_cols))
+
+for c in cause_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+action_pool = build_action_pool_from_kitap1(
+    cause_cols,
+    xlsx_path="data/Book.xlsx",
+    col_problem="Problem Group",
+    col_action="Solution",
+    suffix=" - Downtime"
+)
+
+print("Main function you can call: explain_rowlevel(...)")
+print("Example:")
+print("""
+idx = preds_df.index[0]
+part_code = preds_df.loc[idx, "Component"]
+machine = X_test.loc[idx, "Machine"] if ("Machine" in X_test.columns and idx in X_test.index) else None
+mold = X_test.loc[idx, "Device"] if ("Device" in X_test.columns and idx in X_test.index) else None
+qty = X_test.loc[idx, "Quantity"] if ("Quantity" in X_test.columns and idx in X_test.index) else None
+
+info = predict_downtime_for_user_input(part_code, machine=machine, mold=mold, qty=qty)
+
+out_qwen = explain_rowlevel(tokenizer1, model_llm1, df, idx, info, cause_cols, action_pool)
+out_tiny = explain_rowlevel(tokenizer2, model_llm2, df, idx, info, cause_cols, action_pool)
+
+print(out_qwen["stable_json"])
+print(out_tiny["stable_json"])
+""")
