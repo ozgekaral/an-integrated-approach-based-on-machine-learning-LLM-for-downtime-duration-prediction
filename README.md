@@ -4,7 +4,7 @@
 names. 
 ## For quantitative evaluation, downtime names mentioned in the generated text were compared with the top three true downtime causes for the same part/machine/mold combination; precision, recall, and F1 scores were computed. Large language models confidence was labeled as low, medium, or high based on the F1 score. 
 
-![diagram]("C:\Users\KOZ1CKY\OneDrive - Bosch Group\Masaüstü\downtime-llm-explainer\gra\download (1).png")
+![diagram]("https://github.com/ozgekaral/an-integrated-approach-based-on-machine-learning-LLM-for-downtime-duration-prediction/blob/cnn/download%20(1).png")
 
 It has been demonstrated that a two-layer decision support approach (ML prediction + LLM) can produce feasible and consistent outputs for the downtime-duration problem. In the short term, the best predictive performance was achieved with the XGBoost model, while in the long term (daily aggregated setting) the best performance was obtained with Random Forest. This finding indicates that, in the short term, boosting methods are stronger at capturing variability, whereas in the long term, for an aggregated target, the bagging approach yields more stable results.
 
