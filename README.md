@@ -7,7 +7,7 @@
 
 ### It has been demonstrated that a two-layer decision support approach (ML prediction + LLM) can produce feasible and consistent outputs for the downtime-duration problem. In the short term, the best predictive performance was achieved with the XGBoost model, while in the long term (daily aggregated setting) the best performance was obtained with Random Forest. This finding indicates that, in the short term, boosting methods are stronger at capturing variability, whereas in the long term, for an aggregated target, the bagging approach yields more stable results.
 
- <img src="Resim1.png" width="400" alt="diagram">   <img src="Resim2.png" width="400" alt="diagram">
+<img src="long4/pic.png" width="400" alt="diagram">     <img src="long4/pic1.png" width="400" alt="diagram">  
 
 ### The LLM component was used as a question–answer engine: using partial code-combination outputs from the machine learning models, the system queried and interpreted prediction results and generated responses. Subsequently, when provided with the duration values of 18 causes at the part-code combination level, it reported the top three root-cause selections with perfect accuracy. In addition, by constraining the model with a predefined cause/action list, no out-of-pool action generation was observed in the recommendations. From an operational benefit perspective, at least one of the first two suggested actions was always correct.
 
